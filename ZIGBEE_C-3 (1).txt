@@ -1,0 +1,277 @@
+#include "Zigbee.h"
+#include "main.h"
+#include <string.h>
+#include <stddef.h>
+
+extern UART_HandleTypeDef huart1;
+
+/* Default to CLEARWAY-B; main.c can point this at the other node. */
+static uint8_t dest_addr[8] = {
+    0x00, 0x13, 0xA2, 0x00, 0x41, 0xFB, 0x43, 0x19
+};
+
+void Zigbee_SetDestination(const uint8_t *mac_addr)
+{
+    if (mac_addr == NULL)
+    {
+        return;
+    }
+
+    memcpy(dest_addr, mac_addr, 8);
+}
+
+/* XBee checksum over frame data bytes only. */
+static uint8_t Zigbee_Checksum(const uint8_t *raw, uint16_t frame_data_len)
+{
+    uint8_t sum = 0;
+
+    for (uint16_t i = 0; i < frame_data_len; i++)
+    {
+        sum += raw[3 + i];
+    }
+
+    return 0xFF - sum;
+}
+
+/*
+ * API Mode 2 escaping. The delimiter stays as 0x7E; reserved bytes after it
+ * are sent as 0x7D followed by byte ^ 0x20.
+ */
+static uint16_t Zigbee_EscapeApi2(const uint8_t *raw,
+                                  uint16_t raw_len,
+                                  uint8_t *escaped,
+                                  uint16_t escaped_max)
+{
+    if (raw == NULL || escaped == NULL || raw_len == 0U || escaped_max == 0U)
+    {
+        return 0;
+    }
+
+    uint16_t j = 0;
+
+    /* The first byte is the start delimiter. */
+    escaped[j++] = raw[0];
+
+    for (uint16_t i = 1; i < raw_len; i++)
+    {
+        uint8_t b = raw[i];
+
+        if (b == 0x7E || b == 0x7D || b == 0x11 || b == 0x13)
+        {
+            if ((j + 2) > escaped_max)
+            {
+                return 0;
+            }
+
+            escaped[j++] = 0x7D;
+            escaped[j++] = b ^ 0x20;
+        }
+        else
+        {
+            if ((j + 1) > escaped_max)
+            {
+                return 0;
+            }
+
+            escaped[j++] = b;
+        }
+    }
+
+    return j;
+}
+
+/* Read one byte and undo AP=2 escaping if the byte is escaped. */
+static HAL_StatusTypeDef Zigbee_ReadEscapedByte(uint8_t *out_byte,
+                                                uint32_t timeout_ms)
+{
+    uint8_t b = 0;
+    HAL_StatusTypeDef status;
+
+    status = HAL_UART_Receive(&huart1, &b, 1, timeout_ms);
+
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    if (b == 0x7D)
+    {
+        status = HAL_UART_Receive(&huart1, &b, 1, timeout_ms);
+
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+
+        b = b ^ 0x20;
+    }
+
+    *out_byte = b;
+    return HAL_OK;
+}
+
+/* Build and send an XBee 0x10 Transmit Request frame. */
+HAL_StatusTypeDef Zigbee_SendFrame(uint8_t *payload, uint16_t payload_len)
+{
+    if (payload == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    if (payload_len > ZB_MAX_PAYLOAD)
+    {
+        return HAL_ERROR;
+    }
+
+    /* 0x10 request header is 14 bytes before the RF payload. */
+    uint16_t frame_data_len = 14U + payload_len;
+
+    /* Serial frame = delimiter + length + frame data + checksum. */
+    uint16_t raw_len = 1U + 2U + frame_data_len + 1U;
+
+    uint8_t raw[18U + ZB_MAX_PAYLOAD];
+    uint8_t escaped[2U * (18U + ZB_MAX_PAYLOAD)];
+
+    raw[0] = 0x7E;
+    raw[1] = (frame_data_len >> 8) & 0xFF;
+    raw[2] = frame_data_len & 0xFF;
+
+    raw[3] = 0x10;   // Transmit Request
+    raw[4] = 0x01;   // Frame ID
+
+    memcpy(&raw[5], dest_addr, 8);
+
+    raw[13] = 0xFF;  // Unknown 16-bit destination address
+    raw[14] = 0xFE;
+
+    raw[15] = 0x00;  // Broadcast radius
+    raw[16] = 0x00;  // Options
+
+    memcpy(&raw[17], payload, payload_len);
+
+    raw[17 + payload_len] = Zigbee_Checksum(raw, frame_data_len);
+
+    uint16_t escaped_len = Zigbee_EscapeApi2(raw,
+                                             raw_len,
+                                             escaped,
+                                             sizeof(escaped));
+
+    if (escaped_len == 0)
+    {
+        return HAL_ERROR;
+    }
+
+    return HAL_UART_Transmit(&huart1, escaped, escaped_len, 1000);
+}
+
+/* Wait for a 0x90 Receive Packet and copy out its RF payload. */
+HAL_StatusTypeDef Zigbee_ReceivePayload(uint8_t *payload,
+                                         uint16_t payload_max,
+                                         uint16_t *payload_len,
+                                         uint32_t timeout_ms)
+{
+    if (payload == NULL || payload_len == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    *payload_len = 0;
+
+    uint8_t b = 0;
+    HAL_StatusTypeDef status;
+
+    /* Hunt for the next frame delimiter. */
+    uint32_t start_tick = HAL_GetTick();
+
+    while ((HAL_GetTick() - start_tick) < timeout_ms)
+    {
+        status = HAL_UART_Receive(&huart1, &b, 1, 5);
+
+        if (status == HAL_OK)
+        {
+            if (b == 0x7E)
+            {
+                break;
+            }
+        }
+    }
+
+    if (b != 0x7E)
+    {
+        return HAL_TIMEOUT;
+    }
+
+    /* Length bytes can also be escaped in AP=2. */
+    uint8_t len_msb = 0;
+    uint8_t len_lsb = 0;
+
+    status = Zigbee_ReadEscapedByte(&len_msb, 100);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = Zigbee_ReadEscapedByte(&len_lsb, 100);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    uint16_t frame_data_len = ((uint16_t)len_msb << 8) | len_lsb;
+
+    /* Nothing in this project should produce large API frames. */
+    if (frame_data_len == 0 || frame_data_len > 128)
+    {
+        return HAL_ERROR;
+    }
+
+    /* Pull in frame data plus the trailing checksum byte. */
+    uint8_t frame_data[129];
+
+    for (uint16_t i = 0; i < (frame_data_len + 1U); i++)
+    {
+        status = Zigbee_ReadEscapedByte(&frame_data[i], 100);
+
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    /* Digi checksum rule: frame data plus checksum should add to 0xFF. */
+    uint8_t sum = 0;
+
+    for (uint16_t i = 0; i < (frame_data_len + 1U); i++)
+    {
+        sum += frame_data[i];
+    }
+
+    if (sum != 0xFF)
+    {
+        return HAL_ERROR;
+    }
+
+    /* Other API frames are valid, just not payloads for this layer. */
+    if (frame_data[0] != 0x90)
+    {
+        return HAL_BUSY;
+    }
+
+    /* 0x90 has 12 bytes of metadata before RF data begins. */
+    if (frame_data_len < 12)
+    {
+        return HAL_ERROR;
+    }
+
+    uint16_t rf_payload_len = frame_data_len - 12U;
+
+    if (rf_payload_len > payload_max)
+    {
+        return HAL_ERROR;
+    }
+
+    memcpy(payload, &frame_data[12], rf_payload_len);
+    *payload_len = rf_payload_len;
+
+    return HAL_OK;
+}

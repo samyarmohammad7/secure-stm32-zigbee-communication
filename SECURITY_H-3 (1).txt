@@ -1,0 +1,38 @@
+#ifndef INC_SECURITY_H_
+#define INC_SECURITY_H_
+
+#include "main.h"
+#include <stdint.h>
+
+#define SECURE_PACKET_TYPE_THREAT 0xA1
+#define SECURE_PACKET_LEN         11U
+
+#define SECURITY_OK               0U
+#define SECURITY_BAD_FORMAT       1U
+#define SECURITY_BAD_PACKET_TYPE  2U
+#define SECURITY_BAD_MAC          3U
+#define SECURITY_BAD_MARKER       4U
+#define SECURITY_BAD_TAG          5U
+#define SECURITY_BAD_MSG_TYPE     6U
+
+/*
+ * Build one encrypted threat packet:
+ * [type, clear seq, 8-byte XTEA block, keyed check byte].
+ */
+uint8_t Security_BuildThreatPacket(uint8_t seq,
+                                   uint8_t sector,
+                                   uint8_t flags,
+                                   uint8_t severity,
+                                   uint8_t *out_packet,
+                                   uint16_t out_max,
+                                   uint16_t *out_len);
+
+/* Validate and open one encrypted threat packet. */
+uint8_t Security_OpenThreatPacket(const uint8_t *packet,
+                                  uint16_t packet_len,
+                                  uint8_t *seq,
+                                  uint8_t *sector,
+                                  uint8_t *flags,
+                                  uint8_t *severity);
+
+#endif /* INC_SECURITY_H_ */

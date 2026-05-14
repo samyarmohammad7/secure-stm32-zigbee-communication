@@ -1,0 +1,19 @@
+#ifndef INC_ZIGBEE_H_
+#define INC_ZIGBEE_H_
+
+#include "main.h"
+#include <stdint.h>
+
+#define ZB_MAX_PAYLOAD 64
+
+/* Shared XBee API Mode 2 helper. main.c supplies the destination node. */
+void Zigbee_SetDestination(const uint8_t *mac_addr);
+
+HAL_StatusTypeDef Zigbee_SendFrame(uint8_t *payload, uint16_t payload_len);
+
+HAL_StatusTypeDef Zigbee_ReceivePayload(uint8_t *payload,
+                                         uint16_t payload_max,
+                                         uint16_t *payload_len,
+                                         uint32_t timeout_ms);
+
+#endif /* INC_ZIGBEE_H_ */

@@ -1,0 +1,526 @@
+/* USER CODE BEGIN Header */
+/**
+  * @file           : main.c
+  * @brief          : CLEARWAY-A secure threat sender and ACK receiver
+  *
+  * OPERATION CLEARWAY
+  *
+  * Node A builds compact threat reports, protects them with the application
+  * security layer, sends them over XBee API Mode 2, and listens for ACKs from
+  * Node B. XBee network security is handled in XCTU; this code adds the small
+  * encrypted payload used by the two boards.
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+
+/* Private includes */
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include "Zigbee.h"
+#include "Security.h"
+/* USER CODE END Includes */
+
+/* Private define */
+/* USER CODE BEGIN PD */
+#define BUFF_SIZE        512
+#define RX_PAYLOAD_SIZE  80
+#define TX_INTERVAL_MS   1000
+#define ROBOT_ID         'A'
+
+#define MSG_ACK           0x02
+
+#define ACK_STATUS_OK              0x00
+#define ACK_STATUS_BAD_FORMAT      0x01
+#define ACK_STATUS_BAD_TYPE        0x02
+#define ACK_STATUS_EEPROM_FAIL     0x03
+#define ACK_STATUS_SECURITY_FAIL   0x04
+#define ACK_STATUS_REPLAY          0x05
+
+/*
+ * CLEARWAY-B XBee MAC address:
+ * 0013A20041FB4319
+ */
+#define CLEARWAY_B_MAC_0 0x00
+#define CLEARWAY_B_MAC_1 0x13
+#define CLEARWAY_B_MAC_2 0xA2
+#define CLEARWAY_B_MAC_3 0x00
+#define CLEARWAY_B_MAC_4 0x41
+#define CLEARWAY_B_MAC_5 0xFB
+#define CLEARWAY_B_MAC_6 0x43
+#define CLEARWAY_B_MAC_7 0x19
+/* USER CODE END PD */
+
+/* Private variables */
+I2C_HandleTypeDef hi2c1;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+char msgBuff[BUFF_SIZE] = {0};
+int len = 0;
+
+uint8_t threat_seq = 0;
+uint32_t secure_tx_counter = 0;
+uint32_t ack_rx_counter = 0;
+uint32_t last_tx_tick = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+static void Debug_PrintHex(const uint8_t *payload, uint16_t payload_len);
+static void Send_SecureThreatReport(void);
+static void Handle_Ack(const uint8_t *payload, uint16_t payload_len);
+static void Led_TxBlink(void);
+static void Led_AckBlink(void);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+
+static void Debug_PrintHex(const uint8_t *payload, uint16_t payload_len)
+{
+  len = snprintf(msgBuff, BUFF_SIZE, "      Raw hex: ");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+  for (uint16_t i = 0; i < payload_len; i++)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, "%02X ", payload[i]);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+  }
+
+  len = snprintf(msgBuff, BUFF_SIZE, "\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+}
+
+static void Led_TxBlink(void)
+{
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_Delay(60);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+}
+
+static void Led_AckBlink(void)
+{
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_Delay(50);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_Delay(50);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_Delay(50);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+}
+
+static void Send_SecureThreatReport(void)
+{
+  /*
+   * Test pattern used while the real sensor data is mocked.
+   */
+  uint8_t seq = threat_seq;
+  uint8_t sector = (uint8_t)((seq * 7U) & 0xFFU);
+
+  /*
+   * Threat flags:
+   * bit 0 = metallic anomaly
+   * bit 1 = thermal anomaly
+   * bit 2 = disturbed ground
+   * bit 3 = RF trigger suspicion
+   */
+  uint8_t flags = 0x01;
+
+  if ((seq % 2U) == 0U)
+  {
+    flags |= 0x02;
+  }
+
+  if ((seq % 3U) == 0U)
+  {
+    flags |= 0x04;
+  }
+
+  if ((seq % 5U) == 0U)
+  {
+    flags |= 0x08;
+  }
+
+  /*
+   * Keep severity moving so the receiver gets varied records.
+   */
+  uint8_t severity = (uint8_t)(40U + ((seq * 37U) % 216U));
+
+  uint8_t secure_packet[SECURE_PACKET_LEN] = {0};
+  uint16_t secure_len = 0;
+
+  uint8_t sec_status = Security_BuildThreatPacket(seq,
+                                                  sector,
+                                                  flags,
+                                                  severity,
+                                                  secure_packet,
+                                                  sizeof(secure_packet),
+                                                  &secure_len);
+
+  if (sec_status != SECURITY_OK)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE,
+        "[%c] Could not build secure packet: reason=%u\r\n",
+        ROBOT_ID,
+        sec_status);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+    return;
+  }
+
+  HAL_StatusTypeDef tx_status = Zigbee_SendFrame(secure_packet, secure_len);
+
+  if (tx_status == HAL_OK)
+  {
+    secure_tx_counter++;
+
+    len = snprintf(msgBuff, BUFF_SIZE,
+        "\r\n[%c] Sent secure threat report #%lu\r\n"
+        "      Plain values before encryption:\r\n"
+        "      seq      = %u\r\n"
+        "      sector   = %u\r\n"
+        "      flags    = 0x%02X\r\n"
+        "      severity = %u\r\n"
+        "      secure packet length = %u bytes\r\n",
+        ROBOT_ID,
+        secure_tx_counter,
+        seq,
+        sector,
+        flags,
+        severity,
+        secure_len);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+    Debug_PrintHex(secure_packet, secure_len);
+    Led_TxBlink();
+
+    threat_seq++;
+  }
+  else
+  {
+    len = snprintf(msgBuff, BUFF_SIZE,
+        "[%c] Secure threat report transmit failed\r\n",
+        ROBOT_ID);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+  }
+}
+
+static void Handle_Ack(const uint8_t *payload, uint16_t payload_len)
+{
+  ack_rx_counter++;
+
+  len = snprintf(msgBuff, BUFF_SIZE,
+      "\r\n[%c] Received ACK payload #%lu, %u bytes\r\n",
+      ROBOT_ID,
+      ack_rx_counter,
+      payload_len);
+
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+  Debug_PrintHex(payload, payload_len);
+
+  if (payload_len != 3)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE,
+        "[%c] Bad ACK format: expected 3 bytes, got %u\r\n",
+        ROBOT_ID,
+        payload_len);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+    return;
+  }
+
+  if (payload[0] != MSG_ACK)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE,
+        "[%c] Bad ACK type: expected 0x02, got 0x%02X\r\n",
+        ROBOT_ID,
+        payload[0]);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+    return;
+  }
+
+  uint8_t ack_seq = payload[1];
+  uint8_t status  = payload[2];
+
+  len = snprintf(msgBuff, BUFF_SIZE,
+      "[%c] ACK decoded:\r\n"
+      "      type   = 0x%02X\r\n"
+      "      seq    = %u\r\n"
+      "      status = 0x%02X",
+      ROBOT_ID,
+      payload[0],
+      ack_seq,
+      status);
+
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+  if (status == ACK_STATUS_OK)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " OK\r\n");
+  }
+  else if (status == ACK_STATUS_BAD_FORMAT)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " BAD_FORMAT\r\n");
+  }
+  else if (status == ACK_STATUS_BAD_TYPE)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " BAD_TYPE\r\n");
+  }
+  else if (status == ACK_STATUS_EEPROM_FAIL)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " EEPROM_FAIL\r\n");
+  }
+  else if (status == ACK_STATUS_SECURITY_FAIL)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " SECURITY_FAIL\r\n");
+  }
+  else if (status == ACK_STATUS_REPLAY)
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " REPLAY\r\n");
+  }
+  else
+  {
+    len = snprintf(msgBuff, BUFF_SIZE, " UNKNOWN_STATUS\r\n");
+  }
+
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+  Led_AckBlink();
+}
+
+/* USER CODE END 0 */
+
+int main(void)
+{
+  HAL_Init();
+
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+
+  uint8_t clearway_b_mac[8] = {
+      CLEARWAY_B_MAC_0, CLEARWAY_B_MAC_1, CLEARWAY_B_MAC_2, CLEARWAY_B_MAC_3,
+      CLEARWAY_B_MAC_4, CLEARWAY_B_MAC_5, CLEARWAY_B_MAC_6, CLEARWAY_B_MAC_7
+  };
+
+  Zigbee_SetDestination(clearway_b_mac);
+
+  len = snprintf(msgBuff, BUFF_SIZE,
+      "\r\n"
+      "  OPERATION CLEARWAY - Node %c online\r\n"
+      "  Secure threat sender + ACK receiver\r\n"
+      "  XBee: API Mode 2; network security set in XCTU\r\n"
+      "  Payload sizes: threat=11B, ACK=3B\r\n"
+      "  Threat packet: [0xA1, seq, XTEA block, check]\r\n"
+      "  XTEA: 128-bit key, 32 rounds\r\n"
+      "  ACK decode supports OK / EEPROM_FAIL / SECURITY_FAIL / REPLAY\r\n"
+      "  Build: %s %s\r\n\r\n",
+      ROBOT_ID,
+      __DATE__,
+      __TIME__);
+
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+
+  last_tx_tick = HAL_GetTick();
+
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    if ((HAL_GetTick() - last_tx_tick) >= TX_INTERVAL_MS)
+    {
+      Send_SecureThreatReport();
+      last_tx_tick = HAL_GetTick();
+    }
+
+    uint8_t rx_payload[RX_PAYLOAD_SIZE] = {0};
+    uint16_t rx_len = 0;
+
+    HAL_StatusTypeDef rx_status = Zigbee_ReceivePayload(rx_payload,
+                                                        sizeof(rx_payload),
+                                                        &rx_len,
+                                                        30);
+
+    if (rx_status == HAL_OK)
+    {
+      Handle_Ack(rx_payload, rx_len);
+    }
+    else if (rx_status == HAL_ERROR)
+    {
+      len = snprintf(msgBuff, BUFF_SIZE,
+          "[%c] XBee receive frame error\r\n",
+          ROBOT_ID);
+
+      HAL_UART_Transmit(&huart2, (uint8_t*)msgBuff, len, HAL_MAX_DELAY);
+    }
+    else
+    {
+      /*
+       * HAL_TIMEOUT means there is no packet yet.
+       * HAL_BUSY means the XBee frame was valid, but not a Receive Packet.
+       */
+    }
+  }
+}
+
+/*
+ * Configure the system clock.
+ */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/*
+ * Set up I2C1 for the EEPROM bus.
+ */
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/*
+ * Set up USART1 for the XBee module.
+ */
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/*
+ * Set up USART2 for the debug console.
+ */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/*
+ * Set up GPIO pins used by the LED and EEPROM write protect.
+ */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+/*
+ * Stay here if a HAL setup call fails.
+ */
+void Error_Handler(void)
+{
+  __disable_irq();
+
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif

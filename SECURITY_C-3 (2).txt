@@ -1,0 +1,255 @@
+#include "Security.h"
+#include <stddef.h>
+
+/*
+ * Fixed pair key for the application layer. XBee network security is configured
+ * in XCTU; this protects the RF payload itself as well.
+ */
+static const uint32_t CLEARWAY_XTEA_KEY[4] = {
+    0xC1ED2026UL,
+    0xA5A55A5AUL,
+    0x41FB4663UL,
+    0x41FB4319UL
+};
+
+/* Plaintext sentinels used to catch bad decrypts. */
+#define SECURITY_MARKER_0 0xC1
+#define SECURITY_MARKER_1 0xED
+
+#define MSG_THREAT_REPORT 0x01
+
+/* Big-endian helpers for the XTEA block. */
+static uint32_t Security_LoadU32BE(const uint8_t *b)
+{
+    return ((uint32_t)b[0] << 24) |
+           ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8)  |
+           ((uint32_t)b[3]);
+}
+
+static void Security_StoreU32BE(uint32_t v, uint8_t *b)
+{
+    b[0] = (uint8_t)((v >> 24) & 0xFF);
+    b[1] = (uint8_t)((v >> 16) & 0xFF);
+    b[2] = (uint8_t)((v >> 8)  & 0xFF);
+    b[3] = (uint8_t)(v & 0xFF);
+}
+
+/* XTEA block encrypt, 32 rounds. */
+static void Security_XTEA_EncryptBlock(uint8_t block[8])
+{
+    uint32_t v0 = Security_LoadU32BE(&block[0]);
+    uint32_t v1 = Security_LoadU32BE(&block[4]);
+
+    uint32_t sum = 0;
+    const uint32_t delta = 0x9E3779B9UL;
+
+    for (uint8_t i = 0; i < 32; i++)
+    {
+        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^
+              (sum + CLEARWAY_XTEA_KEY[sum & 3U]);
+
+        sum += delta;
+
+        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^
+              (sum + CLEARWAY_XTEA_KEY[(sum >> 11) & 3U]);
+    }
+
+    Security_StoreU32BE(v0, &block[0]);
+    Security_StoreU32BE(v1, &block[4]);
+}
+
+/* Matching XTEA block decrypt. */
+static void Security_XTEA_DecryptBlock(uint8_t block[8])
+{
+    uint32_t v0 = Security_LoadU32BE(&block[0]);
+    uint32_t v1 = Security_LoadU32BE(&block[4]);
+
+    const uint32_t delta = 0x9E3779B9UL;
+    uint32_t sum = delta * 32UL;
+
+    for (uint8_t i = 0; i < 32; i++)
+    {
+        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^
+              (sum + CLEARWAY_XTEA_KEY[(sum >> 11) & 3U]);
+
+        sum -= delta;
+
+        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^
+              (sum + CLEARWAY_XTEA_KEY[sum & 3U]);
+    }
+
+    Security_StoreU32BE(v0, &block[0]);
+    Security_StoreU32BE(v1, &block[4]);
+}
+
+/*
+ * Small tag inside the encrypted block. It is not a full MAC, but it gives the
+ * receiver another quick check after decrypting.
+ */
+static uint8_t Security_PlainTag(uint8_t msg_type,
+                                 uint8_t seq,
+                                 uint8_t sector,
+                                 uint8_t flags,
+                                 uint8_t severity)
+{
+    uint8_t tag = 0xA5;
+
+    tag ^= msg_type;
+    tag ^= (uint8_t)(seq * 17U);
+    tag ^= (uint8_t)(sector * 31U);
+    tag ^= (uint8_t)(flags * 43U);
+    tag ^= (uint8_t)(severity * 59U);
+    tag ^= (uint8_t)(CLEARWAY_XTEA_KEY[0] & 0xFFU);
+    tag ^= (uint8_t)((CLEARWAY_XTEA_KEY[1] >> 8) & 0xFFU);
+
+    return tag;
+}
+
+/* Packet-level check byte over header and ciphertext. */
+static uint8_t Security_PacketMac(const uint8_t *data, uint16_t len)
+{
+    uint8_t mac = 0x3C;
+
+    for (uint16_t i = 0; i < len; i++)
+    {
+        mac ^= data[i];
+        mac = (uint8_t)((mac << 1) | (mac >> 7));
+        mac ^= (uint8_t)((CLEARWAY_XTEA_KEY[i & 3U] >> ((i & 3U) * 8U)) & 0xFFU);
+    }
+
+    return mac;
+}
+
+uint8_t Security_BuildThreatPacket(uint8_t seq,
+                                   uint8_t sector,
+                                   uint8_t flags,
+                                   uint8_t severity,
+                                   uint8_t *out_packet,
+                                   uint16_t out_max,
+                                   uint16_t *out_len)
+{
+    if (out_packet == NULL || out_len == NULL)
+    {
+        return SECURITY_BAD_FORMAT;
+    }
+
+    if (out_max < SECURE_PACKET_LEN)
+    {
+        return SECURITY_BAD_FORMAT;
+    }
+
+    /* Block layout: [type, seq, sector, flags, severity, tag, marker0, marker1]. */
+    uint8_t block[8];
+
+    block[0] = MSG_THREAT_REPORT;
+    block[1] = seq;
+    block[2] = sector;
+    block[3] = flags;
+    block[4] = severity;
+    block[5] = Security_PlainTag(MSG_THREAT_REPORT, seq, sector, flags, severity);
+    block[6] = SECURITY_MARKER_0;
+    block[7] = SECURITY_MARKER_1;
+
+    Security_XTEA_EncryptBlock(block);
+
+    out_packet[0] = SECURE_PACKET_TYPE_THREAT;
+    out_packet[1] = seq;
+
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        out_packet[2 + i] = block[i];
+    }
+
+    out_packet[10] = Security_PacketMac(out_packet, 10);
+
+    *out_len = SECURE_PACKET_LEN;
+
+    return SECURITY_OK;
+}
+
+uint8_t Security_OpenThreatPacket(const uint8_t *packet,
+                                  uint16_t packet_len,
+                                  uint8_t *seq,
+                                  uint8_t *sector,
+                                  uint8_t *flags,
+                                  uint8_t *severity)
+{
+    if (packet == NULL ||
+        seq == NULL ||
+        sector == NULL ||
+        flags == NULL ||
+        severity == NULL)
+    {
+        return SECURITY_BAD_FORMAT;
+    }
+
+    if (packet_len != SECURE_PACKET_LEN)
+    {
+        return SECURITY_BAD_FORMAT;
+    }
+
+    if (packet[0] != SECURE_PACKET_TYPE_THREAT)
+    {
+        return SECURITY_BAD_PACKET_TYPE;
+    }
+
+    uint8_t expected_mac = Security_PacketMac(packet, 10);
+
+    if (packet[10] != expected_mac)
+    {
+        return SECURITY_BAD_MAC;
+    }
+
+    uint8_t block[8];
+
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        block[i] = packet[2 + i];
+    }
+
+    Security_XTEA_DecryptBlock(block);
+
+    uint8_t msg_type_dec = block[0];
+    uint8_t seq_dec      = block[1];
+    uint8_t sector_dec   = block[2];
+    uint8_t flags_dec    = block[3];
+    uint8_t severity_dec = block[4];
+    uint8_t tag_dec      = block[5];
+    uint8_t marker0_dec  = block[6];
+    uint8_t marker1_dec  = block[7];
+
+    if (marker0_dec != SECURITY_MARKER_0 ||
+        marker1_dec != SECURITY_MARKER_1)
+    {
+        return SECURITY_BAD_MARKER;
+    }
+
+    if (msg_type_dec != MSG_THREAT_REPORT)
+    {
+        return SECURITY_BAD_MSG_TYPE;
+    }
+
+    if (seq_dec != packet[1])
+    {
+        return SECURITY_BAD_FORMAT;
+    }
+
+    uint8_t expected_tag = Security_PlainTag(msg_type_dec,
+                                             seq_dec,
+                                             sector_dec,
+                                             flags_dec,
+                                             severity_dec);
+
+    if (tag_dec != expected_tag)
+    {
+        return SECURITY_BAD_TAG;
+    }
+
+    *seq = seq_dec;
+    *sector = sector_dec;
+    *flags = flags_dec;
+    *severity = severity_dec;
+
+    return SECURITY_OK;
+}

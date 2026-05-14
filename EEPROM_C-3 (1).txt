@@ -1,0 +1,160 @@
+#include "EEPROM.h"
+#include "main.h"
+#include <string.h>
+
+extern I2C_HandleTypeDef hi2c1;
+
+/* PB5 is the EEPROM write-protect pin: high protects, low allows writes. */
+static void EEPROM_WriteProtect_Enable(void)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+}
+
+static void EEPROM_WriteProtect_Disable(void)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+}
+
+static HAL_StatusTypeDef EEPROM_WaitReady(void)
+{
+    /* Let the 24LC64 finish its internal write cycle before polling it. */
+    HAL_Delay(8);
+
+    return HAL_I2C_IsDeviceReady(&hi2c1,
+                                 EEPROM_I2C_ADDRESS,
+                                 20,
+                                 100);
+}
+
+HAL_StatusTypeDef EEPROM_ReadBytes(uint16_t mem_addr,
+                                   uint8_t *data,
+                                   uint16_t length)
+{
+    if (data == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    if ((uint32_t)mem_addr + length > EEPROM_TOTAL_BYTES)
+    {
+        return HAL_ERROR;
+    }
+
+    return HAL_I2C_Mem_Read(&hi2c1,
+                            EEPROM_I2C_ADDRESS,
+                            mem_addr,
+                            I2C_MEMADD_SIZE_16BIT,
+                            data,
+                            length,
+                            1000);
+}
+
+HAL_StatusTypeDef EEPROM_WriteBytes(uint16_t mem_addr,
+                                    const uint8_t *data,
+                                    uint16_t length)
+{
+    if (data == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    if ((uint32_t)mem_addr + length > EEPROM_TOTAL_BYTES)
+    {
+        return HAL_ERROR;
+    }
+
+    HAL_StatusTypeDef status = HAL_OK;
+
+    EEPROM_WriteProtect_Disable();
+
+    uint16_t remaining = length;
+    uint16_t current_addr = mem_addr;
+    const uint8_t *current_data = data;
+
+    while (remaining > 0)
+    {
+        /* 24LC64 pages wrap, so split writes at the page boundary. */
+        uint16_t page_offset = current_addr % EEPROM_PAGE_SIZE;
+        uint16_t space_in_page = EEPROM_PAGE_SIZE - page_offset;
+        uint16_t chunk = remaining;
+
+        if (chunk > space_in_page)
+        {
+            chunk = space_in_page;
+        }
+
+        status = HAL_I2C_Mem_Write(&hi2c1,
+                                   EEPROM_I2C_ADDRESS,
+                                   current_addr,
+                                   I2C_MEMADD_SIZE_16BIT,
+                                   (uint8_t*)current_data,
+                                   chunk,
+                                   1000);
+
+        if (status != HAL_OK)
+        {
+            EEPROM_WriteProtect_Enable();
+            return status;
+        }
+
+        status = EEPROM_WaitReady();
+
+        if (status != HAL_OK)
+        {
+            /* A second check helps on slower breadboard wiring. */
+            HAL_Delay(10);
+
+            status = HAL_I2C_IsDeviceReady(&hi2c1,
+                                           EEPROM_I2C_ADDRESS,
+                                           20,
+                                           100);
+
+            if (status != HAL_OK)
+            {
+                EEPROM_WriteProtect_Enable();
+                return status;
+            }
+        }
+
+        current_addr += chunk;
+        current_data += chunk;
+        remaining -= chunk;
+    }
+
+    EEPROM_WriteProtect_Enable();
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef EEPROM_StoreThreat(uint8_t sector,
+                                     uint8_t flags,
+                                     uint8_t severity,
+                                     uint8_t seq)
+{
+    /* Threat records are stored as [sector, flags, severity, latest sequence]. */
+    uint16_t addr = EEPROM_THREAT_BASE_ADDR +
+                    ((uint16_t)sector * EEPROM_THREAT_RECORD_LEN);
+
+    uint8_t record[EEPROM_THREAT_RECORD_LEN];
+
+    record[0] = sector;
+    record[1] = flags;
+    record[2] = severity;
+    record[3] = seq;
+
+    return EEPROM_WriteBytes(addr, record, EEPROM_THREAT_RECORD_LEN);
+}
+
+HAL_StatusTypeDef EEPROM_ReadThreat(uint8_t sector,
+                                    uint8_t *record_out)
+{
+    if (record_out == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    uint16_t addr = EEPROM_THREAT_BASE_ADDR +
+                    ((uint16_t)sector * EEPROM_THREAT_RECORD_LEN);
+
+    return EEPROM_ReadBytes(addr, record_out, EEPROM_THREAT_RECORD_LEN);
+}
